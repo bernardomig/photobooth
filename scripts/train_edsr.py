@@ -3,21 +3,28 @@ import sys
 import argparse
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 
 from apex import amp
 
 import numpy as np
 from numpy import array
 
+from ignite.engine import Events
 from ignite.contrib.handlers import ProgressBar
+
 
 from photobooth.engines.sr_supervised import create_sr_evaluator, create_sr_trainer
 from photobooth.data.datasets import DIV2K
 from photobooth.models import edsr
 
 
-DEVICE = torch.device('cuda', 0)
+dist.init_process_group('nccl', init_method='env://')
+
+torch.cuda.set_device(dist.get_rank())
+DEVICE = torch.device('cuda')
 EPOCHS = 500
 MEAN = torch.tensor([0.4488, 0.4371, 0.4040])
 DS_ROOT = '/srv/datasets/DIV2K'
@@ -105,18 +112,27 @@ train_ds = DIV2K(DS_ROOT, split='train', config='bicubic/x2',
 val_ds = DIV2K(DS_ROOT, split='valid', config='bicubic/x2',
                transforms=valid_tfms(2, 400, MEAN))
 
-train_loader = DataLoader(train_ds, batch_size=16,
-                          shuffle=True, num_workers=16)
-val_loader = DataLoader(val_ds, batch_size=4, shuffle=False,
-                        num_workers=16, drop_last=False)
+train_loader = DataLoader(
+    train_ds, batch_size=16,
+    shuffle=False, num_workers=16,
+    sampler=DistributedSampler(
+        train_ds,
+        num_replicas=dist.get_world_size(), rank=dist.get_rank())
+)
+val_loader = DataLoader(
+    val_ds, batch_size=4, shuffle=False,
+    num_workers=16, drop_last=False,
+    sampler=DistributedSampler(
+        val_ds,
+        num_replicas=dist.get_world_size(), rank=dist.get_rank())
+)
 
 model = edsr.EDSR_baseline_2x(3, 3)
 model = model.to(DEVICE)
 
-
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=1e-3, weight_decay=1e-4,
+    lr=2e-4, weight_decay=1e-4,
 )
 loss_fn = torch.nn.L1Loss()
 scheduler = torch.optim.lr_scheduler.StepLR(
@@ -124,10 +140,43 @@ scheduler = torch.optim.lr_scheduler.StepLR(
 
 (model, loss_fn), optimizer = amp.initialize([model, loss_fn], optimizer)
 
+model = DistributedDataParallel(model, device_ids=[dist.get_rank()])
+
 trainer = create_sr_trainer(
     model,
     loss_fn,
     optimizer,
+    device=DEVICE,
     mixed_precision=True,
 )
-ProgressBar(persist=False).attach(trainer, ['loss', 'pnsr'])
+ProgressBar(persist=False).attach(trainer, ['loss'])
+
+evaluator = create_sr_evaluator(
+    model,
+    device=DEVICE,
+    mean=MEAN,
+)
+
+
+@trainer.on(Events.EPOCH_COMPLETED(every=10))
+def _evaluate(engine):
+    state = evaluator.run(val_loader)
+    print("Epoch {}: {}"
+          .format(trainer.state.epoch, state.metrics))
+
+
+trainer.run(train_loader, max_epochs=EPOCHS)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--batch_size', type=int, required=True)
+    parser.add_argument('--learning-rate', type=float, required=False)
+    parser.add_argument('--epochs', type=int, required=True)
+    parser.add_argument('--model', type=str, required=True)
+    parser.add_argument('--crop_size', type=int, default=48)
+    parser.add_argument('--distributed', action='store_true')
+    parser.add_argument('--mixed_precision', action='store_true')
+
+    pass

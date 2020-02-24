@@ -40,7 +40,6 @@ def create_sr_trainer(
 
     engine = Engine(_update_model)
     RunningAverage(output_transform=lambda x: x).attach(engine, 'loss')
-    RunningAverage(PNSR(1.)).attach(engine, 'pnsr')
 
     return engine
 
@@ -63,10 +62,9 @@ def create_sr_evaluator(
         model.eval()
         x, y = _prepare_batch(batch, device=device, non_blocking=non_blocking)
         with torch.no_grad():
-            y_pred, y = model(x)
+            y_pred = model(x)
         if denormalize:
-            y_pred = denorm_fn(y_pred)
-            y = denorm_fn(y)
+            y_pred, y = map(denorm_fn, [y_pred, y])
         return y_pred, y
 
     engine = Engine(_evaluate_model)
