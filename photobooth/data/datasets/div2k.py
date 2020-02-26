@@ -3,10 +3,18 @@ import cv2
 
 from torch.utils.data import Dataset
 
+configs = [
+    "bicubic/x2", "bicubic/x3", "bicubic/x4", "bicubic/x8", "unknown/x2",
+    "unknown/x3", "unknown/x4", "realistic_mild/x4", "realistic_difficult/x4",
+    "realistic_wild/x4"
+]
+
 
 class DIV2K(Dataset):
     """The Diverse2K dataset contains high quality 2K images.
     It was used for the NTIRE (CVPR '17 and '18) and PIRM (ECCV '18) challenges.
+
+    Homepage: https://data.vision.ee.ethz.ch/cvl/DIV2K/
 
     Args:
       root_dir: the directory containing the dataset.
@@ -22,6 +30,10 @@ class DIV2K(Dataset):
             raise ValueError(
                 "split must be `train` or `valid`, got {}"
                 .format(split))
+        if config not in configs:
+            raise ValueError(
+                "unknown config. Available configs are: [{}]. Got {}."
+                .format(','.join(configs), config))
 
         algo, scale = config.split('/')
 
@@ -38,8 +50,8 @@ class DIV2K(Dataset):
 
         self.examples = [
             {
-                'highres': os.path.join(hr_dir, '{:04d}.png'.format(idx+1)),
-                'lowres': os.path.join(lr_dir, '{:04d}{}.png'.format(idx+1, scale)),
+                'highres': os.path.join(hr_dir, '{:04d}.png'.format(idx + 1)),
+                'lowres': os.path.join(lr_dir, '{:04d}{}.png'.format(idx + 1, scale)),
             }
             for idx in rang
         ]
