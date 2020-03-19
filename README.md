@@ -15,10 +15,21 @@ python -m pip install git+https://github.com/bernardomig/photobooth.git
 
 All weights are downloadable in [this folder](https://uapt33090-my.sharepoint.com/:f:/g/personal/bernardo_lourenco_ua_pt/EjDXHnex3RBCnaMhObpx6v0BNW7foyr6tpVim8eOKUUK6g?e=6BrAQe).
 
+### Use the models
+
+To use the models provided in the package, use as follows:
+
+```python
+from photobooth.models import edsr
+
+model = edsr.edsr_baseline_x2
+
+model.load_state_dict(torch.load('the_model_weights.pth'))
+```
 
 ### Example application
 
-This is an example application using the edsr_baseline_x2 model in the cpu. Remember that the model has to be first compiled to torch_jit (see [this](https://pytorch.org/tutorials/advanced/cpp_export.html)).
+This is an example application using the edsr_baseline_x2 model in the cpu. Remember that the model has to be first compiled to `torch.jit` (see [this](https://pytorch.org/tutorials/advanced/cpp_export.html)).
 
 ```python
 import argparse
