@@ -19,14 +19,8 @@ MEAN = torch.tensor([0.4488, 0.4371, 0.4040])
 
 def create_transforms(upscale, mean):
     def transform(lowres, highres):
-        lh, lw, _ = lowres.shape
-        hh, hw, _ = highres.shape
-
-        # lr_crop = lowres[lh//2-120:lh//2+120, lw//2-120:lw//2+120]
-        # hr_crop = highres[hh//2-360:hh//2+360, hw//2-360:hw//2+360]
-
-        lr_crop = lowres[:450]
-        hr_crop = highres[:900]
+        lr_crop = lowres
+        hr_crop = highres
 
         lr_crop = torch.from_numpy(lr_crop.astype('f4') / 255.)
         hr_crop = torch.from_numpy(hr_crop.astype('f4') / 255.)
@@ -42,21 +36,17 @@ def create_transforms(upscale, mean):
     return transform
 
 
-val_ds = DIV2K(DS_ROOT, split='valid', config='bicubic/x2',
-               transforms=create_transforms(2, MEAN))
+val_ds = DIV2K(DS_ROOT, split='valid', config='bicubic/x4',
+               transforms=create_transforms(4, MEAN))
 val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
                         num_workers=16, drop_last=False)
 
 device = torch.device('cuda')
 
-model = edsr.EDSR_baseline_2x(3, 3)
+model = edsr.edsr_baseline_x4(3, 3)
 checkpoint = torch.load(
-    'checkpoints/model_model_500_pnsr=31.978702545166016.pth', map_location='cpu'
+    'checkpoints/model_model_1690_pnsr=27.356374740600586.pth', map_location='cpu'
 )
-checkpoint = {
-    key[7:]: value
-    for key, value in checkpoint.items()
-}
 
 model.load_state_dict(checkpoint)
 model.to(torch.device('cuda'))
@@ -76,7 +66,7 @@ def denormalize(input):
     mean = MEAN.to(input.device)
     mean = mean.reshape(1, 3, 1, 1)
     img = torch.clamp((input + mean) * 1., 0, 1.)
-    return img[:, :, 10:-10, 10:-10]
+    return img[:, :, 9:-9, 9:-9]
 
 
 mse_total = 0.
@@ -101,7 +91,7 @@ for X, y in tqdm(val_loader):
         mse_total += mean_squared_error(im1, im2)
         pnsr_total += peak_signal_noise_ratio(im1, im2)
         ssim_total += structural_similarity(im1,
-                                            im2, multichannel=True, win_size=11)
+                                            im2, multichannel=True, win_size=7)
 
 
 print("mse_total = ", mse_total / num_examples)

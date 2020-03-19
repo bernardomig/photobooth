@@ -16,7 +16,8 @@ from apex import amp
 import numpy as np
 from numpy import array
 
-from ignite.engine import Events
+from ignite.engine import Events, Engine, _prepare_batch
+from ignite.metrics import RunningAverage
 from ignite.handlers import TerminateOnNan, ModelCheckpoint, DiskSaver, global_step_from_engine
 from ignite.contrib.handlers import ProgressBar
 
@@ -24,6 +25,7 @@ from ignite.contrib.handlers import ProgressBar
 from photobooth.engines.sr_supervised import create_sr_evaluator, create_sr_trainer
 from photobooth.data.datasets import DIV2K
 from photobooth.models import edsr
+from photobooth.models.srgan import SRDescriminator
 from photobooth.transforms import flip_horizontal, flip_vertical, to_tensor, crop_bounding_box, rot_90
 
 
@@ -77,36 +79,6 @@ def train_tfms(crop_size, mean):
     return _transform
 
 
-def valid_tfms(scale_factor, crop_size, mean):
-    def _transform(lowres, highres):
-        h, w, _ = lowres.shape
-
-        x, y = h // 2, w // 2
-
-        x = x - crop_size // 2, x + crop_size // 2
-        y = y - crop_size // 2, y + crop_size // 2
-        lr_crop = lowres[x[0]:x[1], y[0]:y[1]]
-        x = x[0] * scale_factor, x[1] * scale_factor
-        y = y[0] * scale_factor, y[1] * scale_factor
-        hr_crop = highres[x[0]:x[1], y[0]:y[1]]
-
-        # To torch tensor
-        lr_crop = torch.from_numpy(lr_crop.astype('f4') / 255.)
-        hr_crop = torch.from_numpy(hr_crop.astype('f4') / 255.)
-        # Normalize
-        lr_crop.sub_(MEAN)
-        hr_crop.sub_(MEAN)
-        # Swap axis from HWC to CHW
-        lr_crop = lr_crop.permute(2, 0, 1)
-        hr_crop = hr_crop.permute(2, 0, 1)
-
-        # make it bw
-        # lr_crop = lr_crop.mean(0)
-        # hr_crop = hr_crop.mean(0)
-        return {'lowres': lr_crop, 'highres': hr_crop}
-    return _transform
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -137,8 +109,6 @@ if __name__ == "__main__":
 
     train_ds = DIV2K(DS_ROOT, split='train', config='bicubic/x4',
                      transforms=train_tfms(args.crop_size, MEAN))
-    val_ds = DIV2K(DS_ROOT, split='valid', config='bicubic/x4',
-                   transforms=valid_tfms(4, 100, MEAN))
 
     if args.distributed:
         sampler_args = dict(num_replicas=world_size, rank=local_rank)
@@ -147,76 +117,69 @@ if __name__ == "__main__":
         shuffle=False, num_workers=8,
         sampler=(DistributedSampler(train_ds, **sampler_args) if args.distributed else None)
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=4, shuffle=False,
-        num_workers=16, drop_last=False,
-        sampler=(DistributedSampler(val_ds, **sampler_args, shuffle=False)
-                 if args.distributed else None)
-    )
 
     model = edsr.edsr_baseline_x4(3, 3)
-    if args.state_dict is not None:
-        state_dict = torch.load(args.state_dict, map_location='cpu')
-        if args.bootstrap:
-            state_dict = {
-                key: value
-                for key, value in state_dict.items()
-                if key.split('.')[0] not in {'upsampling', 'tail'}
-            }
-        model.load_state_dict(state_dict, strict=False)
+    checkpoint = torch.load('weights/edsr_baseline_x4_pnsr=27.36.pth', map_location='cpu')
+    model.load_state_dict(checkpoint)
 
     model = model.to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate, weight_decay=args.weight_decay,
-    )
-    loss_fn = torch.nn.L1Loss()
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=1500, gamma=0.5)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    descriminator = SRDescriminator(3, 1)
+    descriminator = descriminator.to(device)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+
+    optimizer = torch.optim.AdamW(descriminator.parameters(),
+                                  lr=args.learning_rate,
+                                  weight_decay=args.weight_decay)
 
     if args.mixed_precision:
-        (model, loss_fn), optimizer = amp.initialize([model, loss_fn], optimizer)
+        (model, descriminator), optimizer = amp.initialize([model, descriminator], optimizer)
 
     if args.distributed:
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        descriminator = DistributedDataParallel(descriminator, device_ids=[local_rank])
 
-    trainer = create_sr_trainer(
-        model,
-        loss_fn,
-        optimizer,
-        device=device,
-        mixed_precision=args.mixed_precision,
-    )
+    def _update_model(engine, batch):
+        x, y = _prepare_batch(batch, device=device, non_blocking=True)
+
+        optimizer.zero_grad()
+        with torch.no_grad():
+            fake = model(x)
+        real = y
+        x_gan = torch.cat([fake, real], dim=0)
+        y_gan = torch.cat([
+            torch.zeros(fake.size(0), 1),
+            torch.ones(real.size(0), 1)
+        ]).to(device)
+
+        y_pred = descriminator(x_gan)
+
+        loss = loss_fn(y_pred, y_gan)
+
+        if args.mixed_precision:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
+
+        optimizer.step()
+        return loss
+
+    trainer = Engine(_update_model)
+    RunningAverage(output_transform=lambda x: x).attach(trainer, 'loss')
     ProgressBar(persist=False).attach(trainer, ['loss'])
-    trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
-    trainer.add_event_handler(
-        Events.EPOCH_COMPLETED,
-        lambda _engine: scheduler.step())
-
-    evaluator = create_sr_evaluator(
-        model,
-        device=device,
-        mean=MEAN,
-    )
 
     if local_rank == 0:
         checkpointer = ModelCheckpoint(
             dirname='checkpoints',
             filename_prefix='model',
-            score_name='pnsr',
-            score_function=lambda engine: engine.state.metrics['pnsr'],
+            score_name='loss',
+            score_function=lambda engine: engine.state.metrics['loss'],
             n_saved=5,
             global_step_transform=global_step_from_engine(trainer),
         )
-        evaluator.add_event_handler(
+        trainer.add_event_handler(
             Events.COMPLETED, checkpointer,
-            to_save={'model': model if not args.distributed else model.module})
-
-    @trainer.on(Events.EPOCH_COMPLETED(every=10))
-    def _evaluate(engine):
-        state = evaluator.run(val_loader)
-        if local_rank == 0:
-            print("Epoch {}: {}"
-                  .format(trainer.state.epoch, state.metrics))
+            to_save={'descriminator': descriminator if not args.distributed else descriminator.module})
 
     trainer.run(train_loader, max_epochs=args.epochs)
